@@ -86,7 +86,7 @@ async def get_video_info(url: str) -> VideoInfo:
         "skip_download": True,
     }
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     def _extract():
         try:
@@ -158,7 +158,7 @@ async def download_video(
                     if progress_callback:
                         try:
                             # Async callback ni sync kontekstdan chaqirish
-                            loop = asyncio.get_event_loop()
+                            loop = asyncio.get_running_loop()
                             if loop.is_running():
                                 asyncio.ensure_future(
                                     _async_callback(progress_callback, percent, "downloading")
@@ -169,7 +169,7 @@ async def download_video(
         elif d["status"] == "finished":
             if progress_callback:
                 try:
-                    loop = asyncio.get_event_loop()
+                    loop = asyncio.get_running_loop()
                     if loop.is_running():
                         asyncio.ensure_future(
                             _async_callback(progress_callback, 100, "merging")
@@ -179,7 +179,7 @@ async def download_video(
 
     opts["progress_hooks"] = [_progress_hook]
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     def _download():
         try:

@@ -199,7 +199,7 @@ async def _process_download(
         last_update_time = [0]
 
         async def progress_callback(percent: float, status: str):
-            now = asyncio.get_event_loop().time()
+            now = asyncio.get_running_loop().time()
             # Har 3 sekundda yangilash (flood limitni oldini olish)
             if now - last_update_time[0] < 3:
                 return
@@ -314,7 +314,7 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 # ─── Main ──────────────────────────────────────────────
 
-def main():
+async def main():
     """Botni ishga tushirish"""
     if not BOT_TOKEN:
         print("❌ BOT_TOKEN topilmadi!")
@@ -338,8 +338,24 @@ def main():
     app.add_error_handler(error_handler)
 
     print("✅ Bot tayyor! Ctrl+C bilan to'xtatish mumkin.")
-    app.run_polling(drop_pending_updates=True)
+
+    # Botni ishga tushirish
+    async with app:
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling(drop_pending_updates=True)
+
+        # Bot to'xtatilguncha kutish
+        try:
+            while True:
+                await asyncio.sleep(1)
+        except (KeyboardInterrupt, SystemExit):
+            pass
+        finally:
+            await app.updater.stop()
+            await app.stop()
+            await app.shutdown()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
