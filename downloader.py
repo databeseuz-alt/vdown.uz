@@ -109,6 +109,11 @@ async def get_video_info(url: str) -> VideoInfo:
                     **opts.get("http_headers", {}),
                     "Referer": custom_result["referer"],
                 }
+            if custom_result.get("headers"):
+                opts["http_headers"] = {
+                    **opts.get("http_headers", {}),
+                    **custom_result["headers"],
+                }
 
             def _extract_stream_info():
                 try:
@@ -197,6 +202,8 @@ async def download_video(
             actual_url = stream_info["stream_url"]
             if stream_info.get("referer"):
                 extra_headers["Referer"] = stream_info["referer"]
+            if stream_info.get("headers"):
+                extra_headers.update(stream_info["headers"])
             logger.info(f"Stream URL: {actual_url}")
 
     # Unique ID bilan fayl nomi
