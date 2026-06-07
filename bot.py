@@ -52,6 +52,13 @@ URL_PATTERN = re.compile(
 
 # Foydalanuvchi holatlari (davom etayotgan yuklab olishlar)
 active_downloads: dict[int, bool] = {}
+_global_task_lock = None
+
+def get_global_lock():
+    global _global_task_lock
+    if _global_task_lock is None:
+        _global_task_lock = asyncio.Lock()
+    return _global_task_lock
 
 
 # ─── Command Handlers ─────────────────────────────────
@@ -95,12 +102,14 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     # Tahlil bosqichi
-    status_msg = await update.message.reply_text(MESSAGES["analyzing"])
+    status_msg = await update.message.reply_text("⏳ Navbat kutilmoqda... (Tahlil)")
 
     try:
-        # Video ma'lumotlarini olish
-        await update.message.chat.send_action(ChatAction.TYPING)
-        video_info = await get_video_info(url)
+        async with get_global_lock():
+            await status_msg.edit_text(MESSAGES["analyzing"])
+            # Video ma'lumotlarini olish
+            await update.message.chat.send_action(ChatAction.TYPING)
+            video_info = await get_video_info(url)
 
         # Sifat tanlash tugmalarini ko'rsatish
         qualities = video_info.available_qualities
@@ -134,13 +143,15 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             )
         else:
             # Faqat bitta sifat — darhol yuklab olish
-            await status_msg.edit_text(
-                f"🎬 <b>{_escape_html(video_info.title)}</b>\n"
-                f"⏱ Davomiyligi: {video_info.duration_str}\n\n"
-                f"⬇️ Yuklab olinmoqda...",
-                parse_mode=ParseMode.HTML,
-            )
-            await _process_download(update, context, url, "best", status_msg)
+            await status_msg.edit_text("⏳ Navbat kutilmoqda... (Yuklab olish)")
+            async with get_global_lock():
+                await status_msg.edit_text(
+                    f"🎬 <b>{_escape_html(video_info.title)}</b>\n"
+                    f"⏱ Davomiyligi: {video_info.duration_str}\n\n"
+                    f"⬇️ Yuklab olinmoqda...",
+                    parse_mode=ParseMode.HTML,
+                )
+                await _process_download(update, context, url, "best", status_msg)
 
     except DownloadError as e:
         await status_msg.edit_text(f"❌ {e}")
@@ -170,11 +181,20 @@ async def handle_quality_callback(
 
     status_msg = query.message
     await status_msg.edit_text(
-        f"⬇️ <b>{quality.upper()}</b> sifatda yuklab olinmoqda...",
+        f"⏳ Navbat kutilmoqda... (Yuklab olish)",
         parse_mode=ParseMode.HTML,
     )
 
-    await _process_download(update, context, url, quality, status_msg)
+    try:
+        async with get_global_lock():
+            await status_msg.edit_text(
+                f"⬇️ <b>{quality.upper()}</b> sifatda yuklab olinmoqda...",
+                parse_mode=ParseMode.HTML,
+            )
+            await _process_download(update, context, url, quality, status_msg)
+    except Exception as e:
+        logger.error(f"Yuklab olishda xatolik: {e}")
+        await status_msg.edit_text(f"❌ Yuklab olishda xatolik: {e}")
 
 
 # ─── Download Processing ──────────────────────────────
