@@ -1,0 +1,10 @@
+# ─── Git ignore ──────────────────
+.env
+__pycache__/
+*.pyc
+downloads/
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
