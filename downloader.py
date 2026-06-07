@@ -13,6 +13,7 @@ from typing import Callable, Optional
 import yt_dlp
 
 from config import DOWNLOAD_DIR, YTDLP_OPTIONS, QUALITY_OPTIONS, MAX_FILE_SIZE
+from parsers import is_supported_site, extract_stream_url
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +71,7 @@ class VideoInfo:
 async def get_video_info(url: str) -> VideoInfo:
     """
     Video haqida ma'lumot olish (yuklab olmasdan).
+    Avval yt-dlp, keyin maxsus parserlarni sinab ko'radi.
 
     Args:
         url: Video havolasi
@@ -80,13 +82,61 @@ async def get_video_info(url: str) -> VideoInfo:
     Raises:
         DownloadError: Video topilmasa
     """
+    loop = asyncio.get_running_loop()
+
+    # 1-usul: Avval maxsus parser bilan sinash (o'zbek saytlari uchun)
+    if is_supported_site(url):
+        def _extract_custom():
+            result = extract_stream_url(url)
+            if result:
+                return result
+            return None
+
+        custom_result = await loop.run_in_executor(None, _extract_custom)
+        if custom_result:
+            stream_url = custom_result["stream_url"]
+            title = custom_result.get("title", "Video")
+            logger.info(f"Maxsus parser orqali topildi: {title} -> {stream_url}")
+
+            # m3u8 stream uchun yt-dlp bilan info olish
+            opts = {
+                **YTDLP_OPTIONS,
+                "extract_flat": False,
+                "skip_download": True,
+            }
+            if custom_result.get("referer"):
+                opts["http_headers"] = {
+                    **opts.get("http_headers", {}),
+                    "Referer": custom_result["referer"],
+                }
+
+            def _extract_stream_info():
+                try:
+                    with yt_dlp.YoutubeDL(opts) as ydl:
+                        info = ydl.extract_info(stream_url, download=False)
+                        if info:
+                            info["title"] = title  # Asl sarlavha
+                            return info
+                except Exception as e:
+                    logger.warning(f"yt-dlp stream info xatosi: {e}")
+                # Fallback: oddiy info
+                return {
+                    "title": title,
+                    "url": stream_url,
+                    "duration": 0,
+                    "formats": [],
+                    "ext": "mkv",
+                }
+
+            info = await loop.run_in_executor(None, _extract_stream_info)
+            return VideoInfo(info)
+
+    # 2-usul: yt-dlp bilan to'g'ridan-to'g'ri sinash
     opts = {
         **YTDLP_OPTIONS,
         "extract_flat": False,
         "skip_download": True,
     }
-
-    loop = asyncio.get_running_loop()
 
     def _extract():
         try:
@@ -119,6 +169,7 @@ async def download_video(
 ) -> Path:
     """
     Videoni yuklab olish va MKV formatga birlashtirish.
+    Avval maxsus parser, keyin yt-dlp to'g'ridan-to'g'ri sinab ko'radi.
 
     Args:
         url: Video havolasi
@@ -131,6 +182,23 @@ async def download_video(
     Raises:
         DownloadError: Yuklab olishda xatolik
     """
+    loop = asyncio.get_running_loop()
+
+    # Maxsus parser orqali stream URL ni olish
+    actual_url = url
+    extra_headers = {}
+
+    if is_supported_site(url):
+        def _get_stream():
+            return extract_stream_url(url)
+
+        stream_info = await loop.run_in_executor(None, _get_stream)
+        if stream_info and stream_info.get("stream_url"):
+            actual_url = stream_info["stream_url"]
+            if stream_info.get("referer"):
+                extra_headers["Referer"] = stream_info["referer"]
+            logger.info(f"Stream URL: {actual_url}")
+
     # Unique ID bilan fayl nomi
     download_id = uuid.uuid4().hex[:8]
     output_template = str(DOWNLOAD_DIR / f"{download_id}_%(title).50s.%(ext)s")
@@ -143,6 +211,13 @@ async def download_video(
         "format": format_str,
         "outtmpl": output_template,
     }
+
+    # Maxsus parser header'larini qo'shish
+    if extra_headers:
+        opts["http_headers"] = {
+            **opts.get("http_headers", {}),
+            **extra_headers,
+        }
 
     # Progress hook
     last_percent = [-1]  # mutable for closure
@@ -179,12 +254,10 @@ async def download_video(
 
     opts["progress_hooks"] = [_progress_hook]
 
-    loop = asyncio.get_running_loop()
-
     def _download():
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=True)
+                info = ydl.extract_info(actual_url, download=True)
                 if info is None:
                     raise DownloadError("Video yuklab olinmadi")
 
@@ -208,11 +281,23 @@ async def download_video(
                 # Boshqa kengaytma bilan bo'lishi mumkin
                 base = Path(filepath).stem
                 for f in DOWNLOAD_DIR.iterdir():
-                    if f.stem == base and f.suffix in (".mkv", ".mp4", ".webm"):
+                    if f.stem == base and f.suffix in (".mkv", ".mp4", ".webm", ".ts"):
                         # MKV ga konvert qilish kerak bo'lsa
                         if f.suffix != ".mkv":
                             return _convert_to_mkv(f)
                         return f
+
+                # download_id bilan boshlanadigan eng yangi faylni topish
+                candidates = sorted(
+                    [f for f in DOWNLOAD_DIR.iterdir() if f.name.startswith(download_id)],
+                    key=lambda f: f.stat().st_mtime,
+                    reverse=True,
+                )
+                if candidates:
+                    f = candidates[0]
+                    if f.suffix != ".mkv":
+                        return _convert_to_mkv(f)
+                    return f
 
                 # Asl fayl
                 orig = Path(filepath)
@@ -292,7 +377,7 @@ async def compress_video(input_path: Path, target_size_mb: int = 49) -> Path:
         str(input_path),
     ]
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     def _compress():
         try:
