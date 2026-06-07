@@ -76,6 +76,15 @@ def _extract_uzmovi(url: str) -> dict | None:
     """uzmovi.net uchun maxsus parser (Playwright yordamida)"""
     logger.info(f"UzMovi Playwright parser ishga tushdi: {url}")
     
+    # Agar bu to'g'ridan-to'g'ri mp4/m3u8 fayl bo'lsa (masalan story.uzmovi.net)
+    if url.lower().endswith('.mp4') or url.lower().endswith('.m3u8'):
+        logger.info(f"To'g'ridan-to'g'ri fayl aniqlandi: {url}")
+        return {
+            "stream_url": url,
+            "title": "Uzmovi Video",
+            "referer": "https://uzmovi.net/"
+        }
+        
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
@@ -83,6 +92,19 @@ def _extract_uzmovi(url: str) -> dict | None:
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             )
             page = context.new_page()
+            
+            intercepted_url = None
+            intercepted_headers = {}
+            
+            def handle_request(route, request):
+                nonlocal intercepted_url, intercepted_headers
+                if (".mpd" in request.url or ".m3u8" in request.url) and intercepted_url is None:
+                    intercepted_url = request.url
+                    intercepted_headers = request.headers
+                    logger.info(f"Stream URL va headerlar ushlandi: {intercepted_url}")
+                route.continue_()
+                
+            page.route("**/*", handle_request)
             
             logger.info("Sahifa yuklanmoqda...")
             page.goto(url, wait_until="load", timeout=30000)
@@ -104,15 +126,24 @@ def _extract_uzmovi(url: str) -> dict | None:
             # JavaScript ishlashini va player yuklanishini kutish
             page.wait_for_timeout(3000)
             
-            stream_url = None
+            # Player play tugmasini bosish (tarmoq so'rovlarini chaqirish uchun)
+            play_btn = page.query_selector('.vjs-big-play-button')
+            if play_btn:
+                logger.info("Play tugmasi bosilmoqda...")
+                play_btn.click()
+                page.wait_for_timeout(3000)
             
-            # 1. To'g'ridan-to'g'ri <source> tegini tekshirish
-            source = page.query_selector("source")
-            if source:
-                stream_url = source.get_attribute("src")
-                logger.info(f"<source> tegidan video topildi: {stream_url}")
-                
-            # 2. Agar <source> bo'lmasa, iframe larni tekshirish (YouTube, VK va boshqalar uchun)
+            stream_url = intercepted_url
+            headers = intercepted_headers
+            
+            # Agar networkdan tushmasa, <source> tegidan qidirish
+            if not stream_url:
+                source = page.query_selector("source")
+                if source:
+                    stream_url = source.get_attribute("src")
+                    logger.info(f"<source> tegidan video topildi: {stream_url}")
+                    
+            # Agar <source> bo'lmasa, iframe larni tekshirish (YouTube, VK va boshqalar uchun)
             if not stream_url:
                 iframes = page.query_selector_all("iframe")
                 for iframe in iframes:
@@ -133,10 +164,17 @@ def _extract_uzmovi(url: str) -> dict | None:
             browser.close()
             
             if stream_url:
+                # Keraksiz headerlarni tozalash
+                clean_headers = {}
+                for k, v in headers.items():
+                    if k.lower() not in ["host", "accept-encoding"]:
+                        clean_headers[k] = v
+                        
                 return {
                     "stream_url": stream_url,
                     "title": title,
-                    "referer": url
+                    "referer": url,
+                    "headers": clean_headers
                 }
             else:
                 logger.error("Playwright yordamida hech qanday video havola topilmadi.")
