@@ -1,13 +1,12 @@
 """
 VDown.uz — Maxsus sayt parserlari
-uzmovi.net va shunga o'xshash o'zbek kino saytlaridan
+uzmovi.net/tv va shunga o'xshash o'zbek kino saytlaridan
 video stream (m3u8) havolalarini ajratib oladi.
 """
 import re
 import logging
 from urllib.parse import urljoin
-
-import requests
+from urllib.request import Request, urlopen
 
 logger = logging.getLogger(__name__)
 
@@ -18,12 +17,9 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/120.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "uz,ru;q=0.9,en;q=0.8",
 }
 
 # ─── Qo'llab-quvvatlanadigan saytlar ro'yxati ─────────
-# Har bir sayt uchun: (domain_pattern, extractor_function)
 SUPPORTED_SITES = {}
 
 
@@ -60,162 +56,156 @@ def extract_stream_url(url: str) -> dict | None:
     return None
 
 
+def _fetch_url(url: str, referer: str = None) -> str:
+    """URL dan HTML yuklab olish (urllib bilan, requests kerak emas)"""
+    headers = {**HEADERS}
+    if referer:
+        headers["Referer"] = referer
+    req = Request(url, headers=headers)
+    resp = urlopen(req, timeout=15)
+    return resp.read().decode("utf-8", errors="ignore")
+
+
 # ═══════════════════════════════════════════════════════
-# UZMOVI.NET Parser
+# UZMOVI Parser (uzmovi.net, uzmovi.tv)
 # ═══════════════════════════════════════════════════════
 
-@register_site(r"uzmovi\.net")
+@register_site(r"uzmovi\.(?:net|tv|com)")
 def _extract_uzmovi(url: str) -> dict | None:
     """
-    uzmovi.net dan video stream URL ni olish.
+    uzmovi.net/tv dan video stream URL ni olish.
     Jarayon:
       1. Sahifa HTML dan iframe src ni topish (uzdown.*/embed/...)
-      2. iframe sahifasidan PlayerJS konfiguratsiyasidan m3u8 URL olish
+      2. iframe sahifasidan file: '...m3u8' ni ajratib olish
     """
     logger.info(f"UzMovi parser: {url}")
 
     # 1-qadam: Asosiy sahifani yuklab olish
-    session = requests.Session()
-    session.headers.update(HEADERS)
-
-    resp = session.get(url, timeout=15)
-    resp.raise_for_status()
-    html = resp.text
+    html = _fetch_url(url)
 
     # Sahifa sarlavhasini olish
     title_match = re.search(r"<title>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
-    title = title_match.group(1).strip() if title_match else "Video"
-    # Ortiqcha matnlarni tozalash
-    title = re.sub(r"\s*[\-–|].*$", "", title).strip()
+    title = title_match.group(1).split("-")[0].strip() if title_match else "Video"
+    # Fayl nomi uchun tozalash
+    title = re.sub(r'[\\/*?:"<>|]', "", title).strip()
+    title = title.replace("(", "").replace(")", "").strip()
 
     # 2-qadam: iframe src ni topish (uzdown domenlari)
-    iframe_patterns = [
-        r'<iframe[^>]+src=["\']([^"\']*uzdown\.[^"\']+)["\']',
-        r'<iframe[^>]+src=["\']([^"\']*embed[^"\']+)["\']',
-        r'src=["\']([^"\']*uzdown\.[^"\']+)["\']',
-        # PlayerJS to'g'ridan-to'g'ri sahifada bo'lishi mumkin
-        r'file:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
-    ]
+    iframe_match = re.search(
+        r'src="(https://uzdown\.(?:live|net|com|org|pw)/embed/[^"]+)"', html
+    )
+    if not iframe_match:
+        # Boshqa iframe formatlarni sinash
+        iframe_match = re.search(
+            r'<iframe[^>]+src=["\']([^"\']*(?:uzdown|embed)[^"\']*)["\']', html, re.IGNORECASE
+        )
 
-    iframe_url = None
-    direct_m3u8 = None
-
-    for pattern in iframe_patterns:
-        match = re.search(pattern, html, re.IGNORECASE)
-        if match:
-            found_url = match.group(1)
-            if ".m3u8" in found_url:
-                direct_m3u8 = found_url
-                break
-            else:
-                iframe_url = found_url
-                break
-
-    # Agar m3u8 to'g'ridan-to'g'ri topilsa
-    if direct_m3u8:
-        logger.info(f"M3U8 to'g'ridan-to'g'ri topildi: {direct_m3u8}")
-        return {
-            "stream_url": direct_m3u8,
-            "title": title,
-            "referer": url,
-        }
-
-    if not iframe_url:
+    if not iframe_match:
         logger.error("iframe topilmadi")
-        # Sahifadagi barcha iframe'larni ko'rsatish (debug)
-        all_iframes = re.findall(r'<iframe[^>]+src=["\']([^"\']+)["\']', html, re.IGNORECASE)
-        logger.debug(f"Barcha iframe'lar: {all_iframes}")
+        # To'g'ridan-to'g'ri m3u8 qidirish
+        m3u8_match = re.search(r"file:\s*['\"]([^'\"]+\.m3u8[^'\"]*)['\"]", html)
+        if m3u8_match:
+            return {
+                "stream_url": m3u8_match.group(1),
+                "title": title,
+                "referer": url,
+            }
         return None
 
-    # URL ni to'liq qilish
+    iframe_url = iframe_match.group(1)
     if iframe_url.startswith("//"):
         iframe_url = "https:" + iframe_url
-    elif not iframe_url.startswith("http"):
-        iframe_url = urljoin(url, iframe_url)
 
     logger.info(f"iframe topildi: {iframe_url}")
 
+    # Epizod raqamini aniqlash
+    ep_match = re.search(r"episode=(\d+)", iframe_url)
+    if ep_match:
+        title = f"{title} - {ep_match.group(1)}-qism"
+
     # 3-qadam: iframe sahifasini yuklab olish
-    resp2 = session.get(
-        iframe_url,
-        timeout=15,
-        headers={**HEADERS, "Referer": url},
-    )
-    resp2.raise_for_status()
-    iframe_html = resp2.text
+    iframe_html = _fetch_url(iframe_url, referer=url)
 
-    # 4-qadam: m3u8 URL ni topish
-    m3u8_patterns = [
-        r'file:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
-        r'src:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
-        r'source:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
-        r'["\']([^"\']+\.m3u8[^"\']*)["\']',
-        # Ba'zan video fayllar to'g'ridan-to'g'ri
-        r'file:\s*["\']([^"\']+\.mp4[^"\']*)["\']',
-    ]
+    # 4-qadam: m3u8 URL ni topish (single quotes — uzmovi standart formati)
+    m3u8_match = re.search(r"file:\s*'([^']+)'", iframe_html)
+    if not m3u8_match:
+        # Double quotes bilan sinash
+        m3u8_match = re.search(r'file:\s*"([^"]+)"', iframe_html)
+    if not m3u8_match:
+        # Umumiy m3u8 qidirish
+        m3u8_match = re.search(r'["\']([^"\']+\.m3u8[^"\']*)["\']', iframe_html)
 
-    for pattern in m3u8_patterns:
-        match = re.search(pattern, iframe_html, re.IGNORECASE)
-        if match:
-            stream_url = match.group(1)
-            logger.info(f"Stream URL topildi: {stream_url}")
-            return {
-                "stream_url": stream_url,
-                "title": title,
-                "referer": iframe_url,
-            }
+    if m3u8_match:
+        stream_url = m3u8_match.group(1)
+        logger.info(f"Stream URL topildi: {stream_url}")
+        return {
+            "stream_url": stream_url,
+            "title": title,
+            "referer": iframe_url,
+        }
+
+    # mp4 to'g'ridan-to'g'ri sinash
+    mp4_match = re.search(r"file:\s*['\"]([^'\"]+\.mp4[^'\"]*)['\"]", iframe_html)
+    if mp4_match:
+        return {
+            "stream_url": mp4_match.group(1),
+            "title": title,
+            "referer": iframe_url,
+        }
 
     logger.error("m3u8/video URL topilmadi iframe ichida")
-    logger.debug(f"iframe HTML (birinchi 500 belgi): {iframe_html[:500]}")
     return None
 
 
 # ═══════════════════════════════════════════════════════
-# ASILMEDIA Parser (shunga o'xshash saytlar)
+# ASILMEDIA Parser
 # ═══════════════════════════════════════════════════════
 
 @register_site(r"asilmedia\.(net|org)")
 def _extract_asilmedia(url: str) -> dict | None:
     """asilmedia.net/org dan video stream URL ni olish."""
     logger.info(f"AsilMedia parser: {url}")
-    # AsilMedia ham xuddi shunday iframe + PlayerJS tuzilishiga ega
     return _generic_iframe_extractor(url)
 
 
-@register_site(r"uzdown\.(live|net|com|org|pw)")
+# ═══════════════════════════════════════════════════════
+# UZDOWN direct embed
+# ═══════════════════════════════════════════════════════
+
+@register_site(r"uzdown\.(?:live|net|com|org|pw)")
 def _extract_uzdown_direct(url: str) -> dict | None:
     """uzdown embed sahifasidan to'g'ridan-to'g'ri m3u8 olish."""
     logger.info(f"UzDown direct parser: {url}")
 
-    session = requests.Session()
-    session.headers.update(HEADERS)
+    html = _fetch_url(url)
 
-    resp = session.get(url, timeout=15)
-    resp.raise_for_status()
-    html = resp.text
+    # Single quotes (uzmovi standart)
+    m3u8_match = re.search(r"file:\s*'([^']+)'", html)
+    if not m3u8_match:
+        m3u8_match = re.search(r'file:\s*"([^"]+)"', html)
+    if not m3u8_match:
+        m3u8_match = re.search(r'["\']([^"\']+\.m3u8[^"\']*)["\']', html)
 
-    m3u8_patterns = [
-        r'file:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
-        r'src:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
-        r'["\']([^"\']+\.m3u8[^"\']*)["\']',
-        r'file:\s*["\']([^"\']+\.mp4[^"\']*)["\']',
-    ]
+    if m3u8_match:
+        return {
+            "stream_url": m3u8_match.group(1),
+            "title": "Video",
+            "referer": url,
+        }
 
-    for pattern in m3u8_patterns:
-        match = re.search(pattern, html, re.IGNORECASE)
-        if match:
-            stream_url = match.group(1)
-            return {
-                "stream_url": stream_url,
-                "title": "Video",
-                "referer": url,
-            }
+    mp4_match = re.search(r"file:\s*['\"]([^'\"]+\.mp4[^'\"]*)['\"]", html)
+    if mp4_match:
+        return {
+            "stream_url": mp4_match.group(1),
+            "title": "Video",
+            "referer": url,
+        }
 
     return None
 
 
 # ═══════════════════════════════════════════════════════
-# Umumiy iframe extractor (ko'p saytlar uchun ishlaydi)
+# Umumiy iframe extractor (ko'p saytlar uchun)
 # ═══════════════════════════════════════════════════════
 
 def _generic_iframe_extractor(url: str) -> dict | None:
@@ -223,20 +213,15 @@ def _generic_iframe_extractor(url: str) -> dict | None:
     Ko'pchilik o'zbek kino saytlari uchun umumiy extractor.
     Iframe → PlayerJS → m3u8 zanjirini kuzatadi.
     """
-    session = requests.Session()
-    session.headers.update(HEADERS)
-
-    resp = session.get(url, timeout=15)
-    resp.raise_for_status()
-    html = resp.text
+    html = _fetch_url(url)
 
     # Sarlavha
     title_match = re.search(r"<title>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
-    title = title_match.group(1).strip() if title_match else "Video"
-    title = re.sub(r"\s*[\-–|].*$", "", title).strip()
+    title = title_match.group(1).split("-")[0].strip() if title_match else "Video"
+    title = re.sub(r'[\\/*?:"<>|]', "", title).strip()
 
     # To'g'ridan-to'g'ri m3u8
-    m3u8_match = re.search(r'["\']([^"\']+\.m3u8[^"\']*)["\']', html)
+    m3u8_match = re.search(r"file:\s*['\"]([^'\"]+\.m3u8[^'\"]*)['\"]", html)
     if m3u8_match:
         return {
             "stream_url": m3u8_match.group(1),
@@ -244,10 +229,14 @@ def _generic_iframe_extractor(url: str) -> dict | None:
             "referer": url,
         }
 
-    # iframe topish
+    # iframe topish (uzdown yoki boshqa embed)
     iframe_match = re.search(
-        r'<iframe[^>]+src=["\']([^"\']+)["\']', html, re.IGNORECASE
+        r'src="(https://uzdown\.(?:live|net|com|org|pw)/embed/[^"]+)"', html
     )
+    if not iframe_match:
+        iframe_match = re.search(
+            r'<iframe[^>]+src=["\']([^"\']+)["\']', html, re.IGNORECASE
+        )
     if not iframe_match:
         return None
 
@@ -258,26 +247,28 @@ def _generic_iframe_extractor(url: str) -> dict | None:
         iframe_url = urljoin(url, iframe_url)
 
     # iframe sahifasini yuklab olish
-    resp2 = session.get(
-        iframe_url,
-        timeout=15,
-        headers={**HEADERS, "Referer": url},
-    )
-    resp2.raise_for_status()
-    iframe_html = resp2.text
+    iframe_html = _fetch_url(iframe_url, referer=url)
 
     # m3u8 topish
-    for pattern in [
-        r'file:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
-        r'["\']([^"\']+\.m3u8[^"\']*)["\']',
-        r'file:\s*["\']([^"\']+\.mp4[^"\']*)["\']',
-    ]:
-        match = re.search(pattern, iframe_html, re.IGNORECASE)
-        if match:
-            return {
-                "stream_url": match.group(1),
-                "title": title,
-                "referer": iframe_url,
-            }
+    m3u8_match = re.search(r"file:\s*'([^']+)'", iframe_html)
+    if not m3u8_match:
+        m3u8_match = re.search(r'file:\s*"([^"]+)"', iframe_html)
+    if not m3u8_match:
+        m3u8_match = re.search(r'["\']([^"\']+\.m3u8[^"\']*)["\']', iframe_html)
+
+    if m3u8_match:
+        return {
+            "stream_url": m3u8_match.group(1),
+            "title": title,
+            "referer": iframe_url,
+        }
+
+    mp4_match = re.search(r"file:\s*['\"]([^'\"]+\.mp4[^'\"]*)['\"]", iframe_html)
+    if mp4_match:
+        return {
+            "stream_url": mp4_match.group(1),
+            "title": title,
+            "referer": iframe_url,
+        }
 
     return None
